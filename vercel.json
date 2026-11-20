@@ -5,6 +5,7 @@
   "outputDirectory": "dist",
   "functions": {
     "api/addon.ts": {
+      "maxDuration": 60,
       "includeFiles": "{wrangler.toml,worker-package.json,src/index.ts,src/matcher.ts,src/ui.ts}"
     }
   },

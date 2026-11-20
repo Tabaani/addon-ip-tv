@@ -144,7 +144,7 @@ export default function App() {
               [
                 ['configure', 'VOD Addon'],
                 ['livetv', 'Live TV Addon'],
-                ['tester', 'Stream Tester'],
+                ['tester', 'Addon Tester'],
                 ['lab', 'Match Lab'],
                 ['deploy', 'Deploy Worker'],
               ] as Array<[ActiveTab, string]>

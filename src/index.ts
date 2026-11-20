@@ -172,7 +172,7 @@ const XTREAM_USER_AGENT = 'VLC/3.0.20 LibVLC/3.0.20';
 const CATALOG_CACHE_TTL = 6 * 60 * 60; // 6 hours
 const META_CACHE_TTL = 24 * 60 * 60; // 24 hours
 const CATALOG_PAGE_SIZE = 100;
-const UPSTREAM_TIMEOUT_MS = 18_000;
+const UPSTREAM_TIMEOUT_MS = 28_000;
 
 const CORS_HEADERS: Record<string, string> = {
   'Access-Control-Allow-Origin': '*',
@@ -180,13 +180,14 @@ const CORS_HEADERS: Record<string, string> = {
   'Access-Control-Allow-Headers': '*',
 };
 
-// Bounded in-memory TTL fallback used when running outside Cloudflare Workers (e.g. Node dev)
+// Bounded in-memory TTL fallback used on Node.js / Vercel (stores slimmed objects directly without JSON re-parse overhead)
 interface MemoryCacheEntry {
   expiresAt: number;
-  body: string;
+  value: unknown;
 }
 const memoryCache = new Map<string, MemoryCacheEntry>();
-const MEMORY_CACHE_MAX_ENTRIES = 80;
+const MEMORY_CACHE_MAX_ENTRIES = 60;
+const inFlightFetches = new Map<string, Promise<unknown>>();
 
 function getEdgeCache(): Cache | null {
   const g = globalThis as unknown as { caches?: { default?: Cache } };
@@ -213,11 +214,7 @@ async function readCache<T>(cacheKeyUrl: string): Promise<T | null> {
     memoryCache.delete(cacheKeyUrl);
     return null;
   }
-  try {
-    return JSON.parse(entry.body) as T;
-  } catch {
-    return null;
-  }
+  return entry.value as T;
 }
 
 async function writeCache(
@@ -226,21 +223,25 @@ async function writeCache(
   ttlSeconds: number,
   ctx?: WorkerExecutionContext
 ): Promise<void> {
-  const serialized = JSON.stringify(payload);
   const edgeCache = getEdgeCache();
   if (edgeCache) {
-    const response = new Response(serialized, {
-      status: 200,
-      headers: {
-        'Content-Type': 'application/json; charset=utf-8',
-        'Cache-Control': `public, max-age=${ttlSeconds}`,
-      },
-    });
-    const putPromise = edgeCache.put(new Request(cacheKeyUrl, { method: 'GET' }), response);
-    if (ctx) {
-      ctx.waitUntil(putPromise);
-    } else {
-      await putPromise;
+    try {
+      const serialized = JSON.stringify(payload);
+      const response = new Response(serialized, {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': `public, max-age=${ttlSeconds}`,
+        },
+      });
+      const putPromise = edgeCache.put(new Request(cacheKeyUrl, { method: 'GET' }), response);
+      if (ctx) {
+        ctx.waitUntil(putPromise);
+      } else {
+        await putPromise;
+      }
+    } catch {
+      // Skip edge cache write if payload exceeds edge cache item size
     }
     return;
   }
@@ -251,8 +252,78 @@ async function writeCache(
   }
   memoryCache.set(cacheKeyUrl, {
     expiresAt: Date.now() + ttlSeconds * 1000,
-    body: serialized,
+    value: payload,
   });
+}
+
+/**
+ * Normalize Xtream API list responses: some PHP-based panels serialize filtered
+ * arrays as JSON objects ({ "0": {...}, "1": {...} }) instead of arrays.
+ */
+function toXtreamArray<T>(raw: unknown): T[] {
+  if (Array.isArray(raw)) return raw as T[];
+  if (raw && typeof raw === 'object') {
+    return Object.values(raw as Record<string, T>).filter(
+      (item): item is T => Boolean(item && typeof item === 'object')
+    );
+  }
+  return [];
+}
+
+/**
+ * Strip heavy unused fields (multi-KB plots, cast lists, backdrop arrays) from
+ * bulk 20k+ item catalog responses so edge & serverless caches stay fast and tiny.
+ */
+function slimXtreamResponse(action: string | null, raw: unknown): unknown {
+  if (action === 'get_vod_streams') {
+    return toXtreamArray<XtreamVodItem>(raw).map((v) => ({
+      name: v.name,
+      stream_id: v.stream_id,
+      stream_icon: v.stream_icon,
+      rating: v.rating,
+      category_id: v.category_id,
+      container_extension: v.container_extension,
+      tmdb: v.tmdb,
+      tmdb_id: v.tmdb_id,
+      imdb_id: v.imdb_id,
+      year: v.year,
+      releaseDate: v.releaseDate,
+    }));
+  }
+
+  if (action === 'get_series') {
+    return toXtreamArray<XtreamSeriesItem>(raw).map((s) => ({
+      name: s.name,
+      series_id: s.series_id,
+      cover: s.cover,
+      rating: s.rating,
+      category_id: s.category_id,
+      tmdb: s.tmdb,
+      tmdb_id: s.tmdb_id,
+      imdb_id: s.imdb_id,
+      year: s.year,
+      releaseDate: s.releaseDate,
+      release_date: s.release_date,
+    }));
+  }
+
+  if (action === 'get_vod_categories' || action === 'get_series_categories' || action === 'get_live_categories') {
+    return toXtreamArray<XtreamCategory>(raw).map((c) => ({
+      category_id: c.category_id,
+      category_name: c.category_name,
+    }));
+  }
+
+  if (action === 'get_live_streams') {
+    return toXtreamArray<XtreamLiveChannel>(raw).map((ch) => ({
+      name: ch.name,
+      stream_id: ch.stream_id,
+      stream_icon: ch.stream_icon,
+      category_id: ch.category_id,
+    }));
+  }
+
+  return raw;
 }
 
 function jsonResponse(data: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
@@ -504,30 +575,46 @@ async function fetchXtreamAction<T>(
     .map(([k, v]) => `${k}=${v}`)
     .join('&');
 
-  let cacheKeyUrl = '';
+  const fingerprint = await hashKey(`${config.host}|${config.username}|${config.password}|${cacheNamespace}|${extraSig}`);
+  const cacheKeyUrl = `https://xtream-cache.internal/${cacheNamespace}/${fingerprint}.json`;
+
   if (cacheTtlSeconds > 0) {
-    const fingerprint = await hashKey(`${config.host}|${config.username}|${config.password}|${cacheNamespace}|${extraSig}`);
-    cacheKeyUrl = `https://xtream-cache.internal/${cacheNamespace}/${fingerprint}.json`;
     const cached = await readCache<T>(cacheKeyUrl);
     if (cached !== null) {
       return cached;
     }
   }
 
-  const data = await fetchJsonWithTimeout<T>(
-    upstreamUrl,
-    {
-      'User-Agent': XTREAM_USER_AGENT,
-      Accept: 'application/json, text/plain, */*',
-    },
-    true
-  );
-
-  if (cacheTtlSeconds > 0 && cacheKeyUrl) {
-    await writeCache(cacheKeyUrl, data, cacheTtlSeconds, ctx);
+  // Deduplicate concurrent identical upstream requests (e.g. Nuvio loading Discover + Search simultaneously)
+  const existingFlight = inFlightFetches.get(cacheKeyUrl);
+  if (existingFlight) {
+    return (await existingFlight) as T;
   }
 
-  return data;
+  const fetchPromise = (async () => {
+    const raw = await fetchJsonWithTimeout<unknown>(
+      upstreamUrl,
+      {
+        'User-Agent': XTREAM_USER_AGENT,
+        Accept: 'application/json, text/plain, */*',
+      },
+      true
+    );
+    const data = slimXtreamResponse(action, raw) as T;
+
+    if (cacheTtlSeconds > 0) {
+      await writeCache(cacheKeyUrl, data, cacheTtlSeconds, ctx);
+    }
+
+    return data;
+  })();
+
+  inFlightFetches.set(cacheKeyUrl, fetchPromise);
+  try {
+    return await fetchPromise;
+  } finally {
+    inFlightFetches.delete(cacheKeyUrl);
+  }
 }
 
 async function fetchCategoryMap(
@@ -707,18 +794,30 @@ function buildManifest(configured: boolean, brand = 'IPTV 8K') {
   };
 }
 
+function safeDecodePart(str: string): string {
+  try {
+    return decodeURIComponent(str.replace(/\+/g, ' '));
+  } catch {
+    return str;
+  }
+}
+
 function parseExtraParams(extraSegment?: string): { search: string; skip: number } {
   let search = '';
   let skip = 0;
   if (!extraSegment) return { search, skip };
 
-  const cleaned = extraSegment.replace(/\.json$/i, '');
-  const pairs = cleaned.split('&');
+  let cleaned = extraSegment.replace(/\.json$/i, '');
+  if (!cleaned.includes('=') && /%3d/i.test(cleaned)) {
+    cleaned = safeDecodePart(cleaned);
+  }
+
+  const pairs = cleaned.split(/&|%26/i);
   for (const pair of pairs) {
     const eqIdx = pair.indexOf('=');
     if (eqIdx === -1) continue;
-    const key = decodeURIComponent(pair.slice(0, eqIdx));
-    const val = decodeURIComponent(pair.slice(eqIdx + 1));
+    const key = safeDecodePart(pair.slice(0, eqIdx)).trim();
+    const val = safeDecodePart(pair.slice(eqIdx + 1));
     if (key === 'search') {
       search = val.trim();
     } else if (key === 'skip') {
@@ -914,31 +1013,48 @@ async function handleCatalog(
       needsCategories ? fetchCategoryMap(config, type, ctx) : Promise.resolve(new Map<string, string>()),
     ]);
 
-    const items = Array.isArray(itemsRaw) ? itemsRaw : [];
-    const normalizedSearch = search ? normalizeTitle(search, type === 'series') : '';
+    const items = toXtreamArray<XtreamVodItem | XtreamSeriesItem>(itemsRaw);
     const lowerSearch = search.toLowerCase();
+    const searchTokens = lowerSearch
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .split(/[^a-z0-9\u0600-\u06ff\u0400-\u04ff\u3040-\u30ff\u4e00-\u9fff]+/i)
+      .filter((tok) => tok.length > 0);
 
-    const filtered = items.filter((item) => {
-      if (!item || typeof item.name !== 'string') return false;
+    const filtered: Array<XtreamVodItem | XtreamSeriesItem> = [];
+    const targetLimit = skip + CATALOG_PAGE_SIZE;
+
+    for (const item of items) {
+      if (!item || typeof item.name !== 'string') continue;
 
       if (needsCategories) {
         const catName = categoryMap.get(String(item.category_id));
         if (!passesCategoryAndKeywordFilter(item.name, catName, includeKw, excludeKw)) {
-          return false;
+          continue;
         }
       }
 
       if (lowerSearch) {
         const rawLower = item.name.toLowerCase();
-        if (rawLower.includes(lowerSearch)) return true;
-        if (normalizedSearch && normalizeTitle(item.name, type === 'series').includes(normalizedSearch)) {
-          return true;
+        if (!rawLower.includes(lowerSearch)) {
+          // Fast multi-token match (handles punctuation/country-tag differences without regex overhead per item)
+          let allTokensFound = searchTokens.length > 0;
+          for (const tok of searchTokens) {
+            if (!rawLower.includes(tok)) {
+              allTokensFound = false;
+              break;
+            }
+          }
+          if (!allTokensFound) continue;
         }
-        return false;
       }
 
-      return true;
-    });
+      filtered.push(item);
+      // Short-circuit once we have enough items for the requested page (huge speedup on Discover!)
+      if (!lowerSearch && filtered.length >= targetLimit) {
+        break;
+      }
+    }
 
     const page = filtered.slice(skip, skip + CATALOG_PAGE_SIZE);
     const metas: StremioMetaPreview[] = page.map((entry) => {
@@ -971,15 +1087,17 @@ async function handleCatalog(
         posterShape: 'poster',
         releaseInfo: yearMatch ? yearMatch[1] : undefined,
         imdbRating: ser.rating ? String(ser.rating) : undefined,
-        description: ser.plot || undefined,
       };
     });
 
     return jsonResponse({ metas }, 200, {
-      'Cache-Control': 'public, max-age=300',
+      'Cache-Control': 'public, max-age=300, s-maxage=1800, stale-while-revalidate=21600',
+      'Vercel-CDN-Cache-Control': 'public, s-maxage=1800, stale-while-revalidate=21600',
     });
   } catch {
-    return jsonResponse({ metas: [] }, 200);
+    return jsonResponse({ metas: [] }, 200, {
+      'Cache-Control': 'no-store',
+    });
   }
 }
 

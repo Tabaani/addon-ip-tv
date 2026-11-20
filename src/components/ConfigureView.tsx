@@ -291,7 +291,7 @@ export const ConfigureView: React.FC<ConfigureViewProps> = ({
                   onClick={onNavigateToTester}
                   className="ml-auto text-sm font-medium text-blue-600 hover:text-blue-700 transition-colors whitespace-nowrap shrink-0"
                 >
-                  Open in Stream Tester →
+                  Open in Addon Tester →
                 </button>
               )}
             </div>

@@ -93,12 +93,25 @@ async function handleWorkerSource(res: ServerResponse): Promise<void> {
   }
 }
 
+function buildCatalogExtraSegment(parsedUrl: URL, rawExtra: string): string {
+  const parts: string[] = [];
+  if (rawExtra) parts.push(rawExtra);
+
+  for (const key of ['search', 'skip', 'genre']) {
+    const val = parsedUrl.searchParams.get(key);
+    if (val !== null && val !== '' && !rawExtra.includes(`${key}=`)) {
+      parts.push(`${key}=${encodeURIComponent(val)}`);
+    }
+  }
+  return parts.join('&');
+}
+
 function resolveCanonicalPath(parsedUrl: URL): string {
   const route = getParam(parsedUrl, '__route');
   const config = getParam(parsedUrl, 'config');
   const type = getParam(parsedUrl, 'type');
   const id = getParam(parsedUrl, 'id');
-  const extra = getParam(parsedUrl, 'extra');
+  const extra = buildCatalogExtraSegment(parsedUrl, getParam(parsedUrl, 'extra'));
 
   switch (route) {
     case 'test':
