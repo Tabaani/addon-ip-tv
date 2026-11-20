@@ -16,8 +16,8 @@ import {
   normalizeTitle,
   parseKeywordList,
   passesCategoryAndKeywordFilter,
-} from './matcher';
-import { renderConfigHtml } from './ui';
+} from './matcher.js';
+import { renderConfigHtml } from './ui.js';
 
 export interface WorkerEnv {
   ADDON_BRAND?: string;

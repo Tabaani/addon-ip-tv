@@ -4,34 +4,42 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "functions": {
-    "api/[...slug].ts": {
+    "api/addon.ts": {
       "includeFiles": "{wrangler.toml,worker-package.json,src/index.ts,src/matcher.ts,src/ui.ts}"
     }
   },
   "rewrites": [
     {
+      "source": "/api/test",
+      "destination": "/api/addon?__route=test"
+    },
+    {
+      "source": "/api/worker-source",
+      "destination": "/api/addon?__route=worker-source"
+    },
+    {
       "source": "/manifest.json",
-      "destination": "/api/manifest.json"
+      "destination": "/api/addon?__route=root-manifest"
     },
     {
       "source": "/worker-ui",
-      "destination": "/api/worker-ui"
+      "destination": "/api/addon?__route=worker-ui"
     },
     {
       "source": "/:config/manifest.json",
-      "destination": "/api/:config/manifest.json"
+      "destination": "/api/addon?__route=manifest&config=:config"
     },
     {
       "source": "/:config/catalog/:type/:id.json",
-      "destination": "/api/:config/catalog/:type/:id.json"
+      "destination": "/api/addon?__route=catalog&config=:config&type=:type&id=:id"
     },
     {
       "source": "/:config/catalog/:type/:id/:extra.json",
-      "destination": "/api/:config/catalog/:type/:id/:extra.json"
+      "destination": "/api/addon?__route=catalog&config=:config&type=:type&id=:id&extra=:extra"
     },
     {
       "source": "/:config/stream/:type/:id.json",
-      "destination": "/api/:config/stream/:type/:id.json"
+      "destination": "/api/addon?__route=stream&config=:config&type=:type&id=:id"
     },
     {
       "source": "/configure",

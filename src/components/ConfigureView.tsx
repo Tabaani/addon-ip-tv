@@ -67,7 +67,16 @@ export const ConfigureView: React.FC<ConfigureViewProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(config),
       });
-      const data = (await response.json()) as ConnectionTestResult;
+      const rawText = await response.text();
+      let data: ConnectionTestResult;
+      try {
+        data = JSON.parse(rawText) as ConnectionTestResult;
+      } catch {
+        data = {
+          ok: false,
+          error: `Server returned HTTP ${response.status} (non-JSON response). Check deployment function logs.`,
+        };
+      }
       setTestResult(data);
       if (data.ok && data.normalizedHost && data.normalizedHost !== config.host) {
         onChange({ ...config, host: data.normalizedHost });
