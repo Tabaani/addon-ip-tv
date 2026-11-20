@@ -116,6 +116,8 @@ function resolveCanonicalPath(parsedUrl: URL): string {
         return `/${encodeURIComponent(config)}/catalog/${encodeURIComponent(type)}/${encodeURIComponent(id)}/${extra}.json`;
       }
       return `/${encodeURIComponent(config)}/catalog/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json`;
+    case 'meta':
+      return `/${encodeURIComponent(config)}/meta/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json`;
     case 'stream':
       return `/${encodeURIComponent(config)}/stream/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json`;
     case 'tv-manifest':

@@ -130,6 +130,7 @@ async function startServer() {
   app.all('/:config/manifest.json', bridgeToWorker);
   app.all('/:config/catalog/:type/:id.json', bridgeToWorker);
   app.all('/:config/catalog/:type/:id/:extra.json', bridgeToWorker);
+  app.all('/:config/meta/:type/:id.json', bridgeToWorker);
   app.all('/:config/stream/:type/:id.json', bridgeToWorker);
 
   if (!isProduction) {

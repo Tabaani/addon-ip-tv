@@ -12,6 +12,7 @@ import {
   XtreamCategory,
   XtreamSeriesItem,
   XtreamVodItem,
+  extractQualityLabel,
   findBestMatches,
   normalizeTitle,
   parseKeywordList,
@@ -62,10 +63,13 @@ interface XtreamSeriesEpisode {
   episode_num: string | number;
   title?: string;
   container_extension?: string;
+  season?: string | number;
   info?: {
     duration?: string;
     plot?: string;
     releasedate?: string;
+    release_date?: string;
+    movie_image?: string;
     bitrate?: number;
   };
 }
@@ -74,10 +78,44 @@ interface XtreamSeriesInfoResponse {
   info?: {
     name?: string;
     cover?: string;
+    plot?: string;
+    cast?: string;
+    director?: string;
+    genre?: string;
+    rating?: string | number;
+    backdrop_path?: string | string[];
     tmdb?: string | number;
     releaseDate?: string;
+    release_date?: string;
   };
   episodes?: Record<string, XtreamSeriesEpisode[]> | XtreamSeriesEpisode[][];
+}
+
+interface XtreamVodInfoResponse {
+  info?: {
+    name?: string;
+    o_name?: string;
+    movie_image?: string;
+    cover_big?: string;
+    backdrop_path?: string | string[];
+    plot?: string;
+    description?: string;
+    cast?: string;
+    actors?: string;
+    director?: string;
+    genre?: string;
+    releasedate?: string;
+    release_date?: string;
+    duration?: string;
+    rating?: string | number;
+    tmdb_id?: string | number;
+    imdb_id?: string;
+  };
+  movie_data?: {
+    stream_id?: number | string;
+    name?: string;
+    container_extension?: string;
+  };
 }
 
 interface CinemetaResponse {
@@ -623,13 +661,25 @@ async function resolveCanonicalMeta(
 function buildManifest(configured: boolean, brand = 'IPTV 8K') {
   return {
     id: 'org.custom.xtream.vod',
-    version: '1.0.0',
+    version: '1.1.0',
     name: `${brand} VOD & Series`,
     description:
-      'Streams Xtream Codes IPTV VOD movies and series episodes directly on Stremio Cinemeta pages via IMDb & TMDB matching, plus searchable catalogs.',
-    resources: ['catalog', 'stream'],
+      'Streams Xtream Codes IPTV VOD movies and series episodes directly on Stremio Cinemeta pages via IMDb & TMDB matching, plus searchable catalogs with full metadata.',
+    resources: [
+      'catalog',
+      {
+        name: 'meta',
+        types: ['movie', 'series'],
+        idPrefixes: ['xtream:'],
+      },
+      {
+        name: 'stream',
+        types: ['movie', 'series'],
+        idPrefixes: ['tt', 'xtream:'],
+      },
+    ],
     types: ['movie', 'series'],
-    idPrefixes: ['tt'],
+    idPrefixes: ['tt', 'xtream:'],
     catalogs: [
       {
         type: 'movie',
@@ -933,6 +983,227 @@ async function handleCatalog(
   }
 }
 
+function extractValidImageUrl(val?: string | string[] | null): string | undefined {
+  if (!val) return undefined;
+  const candidate = Array.isArray(val) ? val.find((v) => typeof v === 'string' && /^https?:\/\//i.test(v.trim())) : val;
+  if (typeof candidate !== 'string') return undefined;
+  const trimmed = candidate.trim();
+  return /^https?:\/\//i.test(trimmed) ? trimmed : undefined;
+}
+
+function splitCsvField(val?: string | null): string[] | undefined {
+  if (!val || typeof val !== 'string') return undefined;
+  const parts = val
+    .split(/[,/|]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return parts.length > 0 ? parts : undefined;
+}
+
+function toIsoDateOrFallback(rawDate: string | undefined, season: number, episode: number): string {
+  if (rawDate) {
+    const parsed = new Date(rawDate);
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed.toISOString();
+    }
+  }
+  const safeSeason = Math.max(0, Math.min(99, season));
+  const safeEp = Math.max(1, Math.min(365, episode));
+  return new Date(Date.UTC(2000 + safeSeason, 0, safeEp)).toISOString();
+}
+
+function safeDecodeStremioId(rawId: string): string {
+  let out = rawId;
+  for (let i = 0; i < 2; i++) {
+    try {
+      const next = decodeURIComponent(out);
+      if (next === out) break;
+      out = next;
+    } catch {
+      break;
+    }
+  }
+  return out.replace(/\.json$/i, '').trim();
+}
+
+async function handleMeta(
+  config: AddonConfig,
+  type: 'movie' | 'series',
+  rawId: string,
+  ctx?: WorkerExecutionContext
+): Promise<Response> {
+  const decodedId = safeDecodeStremioId(rawId);
+
+  if (type === 'movie') {
+    const movieMatch = decodedId.match(/^xtream:movie:(\d+)$/);
+    if (!movieMatch) {
+      return jsonResponse({ meta: null }, 404);
+    }
+    const streamId = movieMatch[1];
+
+    try {
+      const [vodInfo, vodListRaw] = await Promise.all([
+        fetchXtreamAction<XtreamVodInfoResponse>(
+          config,
+          'get_vod_info',
+          { vod_id: streamId },
+          CATALOG_CACHE_TTL,
+          ctx
+        ).catch(() => null),
+        fetchXtreamAction<XtreamVodItem[]>(config, 'get_vod_streams', {}, CATALOG_CACHE_TTL, ctx).catch(() => []),
+      ]);
+
+      const listItem = Array.isArray(vodListRaw)
+        ? vodListRaw.find((v) => String(v?.stream_id) === streamId)
+        : undefined;
+
+      const info = vodInfo?.info;
+      const name = info?.name || vodInfo?.movie_data?.name || listItem?.name;
+      if (!name) {
+        return jsonResponse({ meta: null }, 404);
+      }
+
+      const poster =
+        extractValidImageUrl(info?.cover_big) ??
+        extractValidImageUrl(info?.movie_image) ??
+        extractValidImageUrl(listItem?.stream_icon);
+      const background = extractValidImageUrl(info?.backdrop_path) ?? poster;
+      const yearSource = info?.releasedate ?? info?.release_date ?? listItem?.year ?? listItem?.releaseDate ?? name;
+      const yearMatch = String(yearSource).match(/\b((?:19|20)\d{2})\b/);
+      const rating = info?.rating ?? listItem?.rating;
+
+      return jsonResponse(
+        {
+          meta: {
+            id: `xtream:movie:${streamId}`,
+            type: 'movie',
+            name,
+            poster,
+            background,
+            posterShape: 'poster',
+            description: info?.plot || info?.description || undefined,
+            releaseInfo: yearMatch ? yearMatch[1] : undefined,
+            runtime: info?.duration || undefined,
+            imdbRating: rating ? String(rating) : undefined,
+            genres: splitCsvField(info?.genre),
+            director: splitCsvField(info?.director),
+            cast: splitCsvField(info?.cast ?? info?.actors),
+          },
+        },
+        200,
+        { 'Cache-Control': 'public, max-age=300' }
+      );
+    } catch {
+      return jsonResponse({ meta: null }, 200);
+    }
+  }
+
+  // Series metadata + full episode list for Stremio & Nuvio
+  const seriesMatch = decodedId.match(/^xtream:series:(\d+)$/);
+  if (!seriesMatch) {
+    return jsonResponse({ meta: null }, 404);
+  }
+  const seriesId = seriesMatch[1];
+
+  try {
+    const [seriesInfo, seriesListRaw] = await Promise.all([
+      fetchXtreamAction<XtreamSeriesInfoResponse>(
+        config,
+        'get_series_info',
+        { series_id: seriesId },
+        CATALOG_CACHE_TTL,
+        ctx
+      ).catch(() => null),
+      fetchXtreamAction<XtreamSeriesItem[]>(config, 'get_series', {}, CATALOG_CACHE_TTL, ctx).catch(() => []),
+    ]);
+
+    const listItem = Array.isArray(seriesListRaw)
+      ? seriesListRaw.find((s) => String(s?.series_id) === seriesId)
+      : undefined;
+
+    const info = seriesInfo?.info;
+    const name = info?.name || listItem?.name;
+    if (!name) {
+      return jsonResponse({ meta: null }, 404);
+    }
+
+    const poster = extractValidImageUrl(info?.cover) ?? extractValidImageUrl(listItem?.cover);
+    const background = extractValidImageUrl(info?.backdrop_path) ?? poster;
+    const yearSource =
+      info?.releaseDate ?? info?.release_date ?? listItem?.year ?? listItem?.releaseDate ?? listItem?.release_date ?? name;
+    const yearMatch = String(yearSource).match(/\b((?:19|20)\d{2})\b/);
+    const rating = info?.rating ?? listItem?.rating;
+
+    // Flatten episodes across all seasons into Stremio's `videos` array
+    const videos: Array<{
+      id: string;
+      title: string;
+      season: number;
+      episode: number;
+      released: string;
+      thumbnail?: string;
+      overview?: string;
+    }> = [];
+
+    const episodesContainer = seriesInfo?.episodes;
+    if (episodesContainer) {
+      const seasonEntries: Array<[number, XtreamSeriesEpisode[]]> = Array.isArray(episodesContainer)
+        ? episodesContainer.map((list, idx) => [idx + 1, Array.isArray(list) ? list : []])
+        : Object.entries(episodesContainer).map(([k, list]) => [
+            Number.parseInt(k, 10) || 1,
+            Array.isArray(list) ? list : [],
+          ]);
+
+      for (const [seasonNum, epList] of seasonEntries) {
+        for (const ep of epList) {
+          if (!ep || ep.id === undefined || ep.id === null) continue;
+          const epNum = Number.parseInt(String(ep.episode_num), 10);
+          if (!Number.isFinite(epNum) || epNum < 0) continue;
+
+          const resolvedSeason = ep.season !== undefined ? Number.parseInt(String(ep.season), 10) || seasonNum : seasonNum;
+          const thumb = extractValidImageUrl(ep.info?.movie_image) ?? poster;
+
+          videos.push({
+            id: `xtream:series:${seriesId}:${resolvedSeason}:${epNum}`,
+            title: ep.title?.trim() || `Episode ${epNum}`,
+            season: resolvedSeason,
+            episode: epNum,
+            released: toIsoDateOrFallback(ep.info?.releasedate ?? ep.info?.release_date, resolvedSeason, epNum),
+            thumbnail: thumb,
+            overview: ep.info?.plot || undefined,
+          });
+        }
+      }
+    }
+
+    videos.sort((a, b) => (a.season !== b.season ? a.season - b.season : a.episode - b.episode));
+
+    return jsonResponse(
+      {
+        meta: {
+          id: `xtream:series:${seriesId}`,
+          type: 'series',
+          name,
+          poster,
+          background,
+          posterShape: 'poster',
+          description: info?.plot || listItem?.plot || undefined,
+          releaseInfo: yearMatch ? yearMatch[1] : undefined,
+          imdbRating: rating ? String(rating) : undefined,
+          genres: splitCsvField(info?.genre ?? listItem?.genre),
+          director: splitCsvField(info?.director ?? listItem?.director),
+          cast: splitCsvField(info?.cast ?? listItem?.cast),
+          videos,
+        },
+      },
+      200,
+      { 'Cache-Control': 'public, max-age=300' }
+    );
+  } catch {
+    return jsonResponse({ meta: null }, 200);
+  }
+}
+
 async function handleStream(
   config: AddonConfig,
   type: 'movie' | 'series',
@@ -940,11 +1211,105 @@ async function handleStream(
   env?: WorkerEnv,
   ctx?: WorkerExecutionContext
 ): Promise<Response> {
-  const decodedId = decodeURIComponent(rawId).replace(/\.json$/i, '').trim();
+  const decodedId = safeDecodeStremioId(rawId);
   const brand = env?.ADDON_BRAND?.trim() || 'IPTV 8K';
   const threshold = Number.parseFloat(env?.MATCH_THRESHOLD ?? '') || DEFAULT_MATCH_THRESHOLD;
 
-  // Parse IMDb ID (tt1375666 or tt0903747:1:2)
+  // Fast direct playback path for items opened from our custom IPTV catalogs (xtream:movie:... / xtream:series:...)
+  if (decodedId.startsWith('xtream:')) {
+    const encodedUser = encodeURIComponent(config.username);
+    const encodedPass = encodeURIComponent(config.password);
+
+    if (type === 'movie') {
+      const m = decodedId.match(/^xtream:movie:(\d+)$/);
+      if (!m) return jsonResponse({ streams: [] });
+      const streamId = m[1];
+
+      try {
+        const [vodInfo, vodListRaw] = await Promise.all([
+          fetchXtreamAction<XtreamVodInfoResponse>(
+            config,
+            'get_vod_info',
+            { vod_id: streamId },
+            CATALOG_CACHE_TTL,
+            ctx
+          ).catch(() => null),
+          fetchXtreamAction<XtreamVodItem[]>(config, 'get_vod_streams', {}, CATALOG_CACHE_TTL, ctx).catch(() => []),
+        ]);
+
+        const listItem = Array.isArray(vodListRaw)
+          ? vodListRaw.find((v) => String(v?.stream_id) === streamId)
+          : undefined;
+        const name = vodInfo?.movie_data?.name || vodInfo?.info?.name || listItem?.name || `VOD #${streamId}`;
+        const ext = (vodInfo?.movie_data?.container_extension || listItem?.container_extension || 'mp4').replace(/^\.+/, '');
+        const quality = extractQualityLabel(name);
+
+        return jsonResponse(
+          {
+            streams: [
+              {
+                name: `${brand}\n[${quality.label}]`,
+                title: `${name}\n${ext.toUpperCase()} · Direct Catalog Stream`,
+                url: `${config.host}/movie/${encodedUser}/${encodedPass}/${streamId}.${ext}`,
+                behaviorHints: { notWebReady: true },
+              },
+            ],
+          },
+          200,
+          { 'Cache-Control': 'public, max-age=300' }
+        );
+      } catch {
+        return jsonResponse({ streams: [] }, 200);
+      }
+    }
+
+    // Direct series episode playback: xtream:series:<seriesId>:<season>:<episode>
+    const s = decodedId.match(/^xtream:series:(\d+):(\d+):(\d+)$/);
+    if (!s) return jsonResponse({ streams: [] });
+    const seriesId = s[1];
+    const season = Number.parseInt(s[2], 10);
+    const episode = Number.parseInt(s[3], 10);
+
+    try {
+      const seriesInfo = await fetchXtreamAction<XtreamSeriesInfoResponse>(
+        config,
+        'get_series_info',
+        { series_id: seriesId },
+        CATALOG_CACHE_TTL,
+        ctx
+      );
+      const ep = findEpisodeInSeriesInfo(seriesInfo, season, episode);
+      if (!ep) return jsonResponse({ streams: [] }, 200);
+
+      const ext = (ep.container_extension || 'mp4').replace(/^\.+/, '');
+      const seriesName = seriesInfo?.info?.name || `Series #${seriesId}`;
+      const epCode = `S${String(season).padStart(2, '0')}E${String(episode).padStart(2, '0')}`;
+      const epTitle = ep.title?.trim() || `${seriesName} ${epCode}`;
+      const quality = extractQualityLabel(seriesName);
+
+      return jsonResponse(
+        {
+          streams: [
+            {
+              name: `${brand}\n[${quality.label}]`,
+              title: `${epTitle}\n${seriesName} · ${epCode} · ${ext.toUpperCase()} · Direct Catalog Stream`,
+              url: `${config.host}/series/${encodedUser}/${encodedPass}/${ep.id}.${ext}`,
+              behaviorHints: {
+                notWebReady: true,
+                bingeGroup: `xtream-series-${seriesId}-${quality.label}`,
+              },
+            },
+          ],
+        },
+        200,
+        { 'Cache-Control': 'public, max-age=300' }
+      );
+    } catch {
+      return jsonResponse({ streams: [] }, 200);
+    }
+  }
+
+  // Standard Cinemeta IMDb ID path (tt1375666 or tt0903747:1:2)
   const idParts = decodedId.split(':');
   const imdbId = idParts[0];
 
@@ -1515,7 +1880,7 @@ async function handleLiveTvMeta(
   rawId: string,
   ctx?: WorkerExecutionContext
 ): Promise<Response> {
-  const decodedId = decodeURIComponent(rawId).replace(/\.json$/i, '').trim();
+  const decodedId = safeDecodeStremioId(rawId);
   const match = decodedId.match(/^xtv:(\d+)$/);
   if (!match) {
     return jsonResponse({ meta: null }, 404);
@@ -1568,7 +1933,7 @@ async function handleLiveTvStream(
   rawId: string,
   ctx?: WorkerExecutionContext
 ): Promise<Response> {
-  const decodedId = decodeURIComponent(rawId).replace(/\.json$/i, '').trim();
+  const decodedId = safeDecodeStremioId(rawId);
   const match = decodedId.match(/^xtv:(\d+)$/);
   if (!match) {
     return jsonResponse({ streams: [] });
@@ -1732,7 +2097,19 @@ export async function handleWorkerRequest(
     return handleCatalog(decoded.config, type, catalogId, extra, ctx);
   }
 
-  // 4) GET /:config/stream/:type/:id.json
+  // 4) GET /:config/meta/:type/:id.json
+  const metaMatch = path.match(/^\/([^/]+)\/meta\/(movie|series)\/([^/]+)\.json$/);
+  if (metaMatch) {
+    const decoded = decodeConfig(metaMatch[1]);
+    if (!decoded.ok) {
+      return jsonResponse({ meta: null, error: decoded.error }, 400);
+    }
+    const type = metaMatch[2] as 'movie' | 'series';
+    const id = metaMatch[3];
+    return handleMeta(decoded.config, type, id, ctx);
+  }
+
+  // 5) GET /:config/stream/:type/:id.json
   const streamMatch = path.match(/^\/([^/]+)\/stream\/(movie|series)\/([^/]+)\.json$/);
   if (streamMatch) {
     const decoded = decodeConfig(streamMatch[1]);

@@ -66,6 +66,10 @@
       "destination": "/api/addon?__route=catalog&config=:config&type=:type&id=:id&extra=:extra"
     },
     {
+      "source": "/:config/meta/:type/:id.json",
+      "destination": "/api/addon?__route=meta&config=:config&type=:type&id=:id"
+    },
+    {
       "source": "/:config/stream/:type/:id.json",
       "destination": "/api/addon?__route=stream&config=:config&type=:type&id=:id"
     },

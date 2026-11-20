@@ -452,8 +452,8 @@ export const ConfigureView: React.FC<ConfigureViewProps> = ({
             <h3 className="text-xs font-semibold text-slate-700">Protocol guarantees</h3>
             <ul className="space-y-2 text-xs text-slate-600">
               <li className="flex items-start justify-between gap-3">
-                <span>Cinemeta prefix binding</span>
-                <span className="font-mono text-slate-800">idPrefixes: [&quot;tt&quot;]</span>
+                <span>ID prefix bindings</span>
+                <span className="font-mono text-slate-800">[&quot;tt&quot;, &quot;xtream:&quot;]</span>
               </li>
               <li className="flex items-start justify-between gap-3">
                 <span>Upstream User-Agent</span>
