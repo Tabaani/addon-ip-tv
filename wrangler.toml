@@ -1,0 +1,11 @@
+name = "xtream-stremio-addon"
+main = "src/index.ts"
+compatibility_date = "2025-02-01"
+workers_dev = true
+
+[observability]
+enabled = true
+
+[vars]
+ADDON_BRAND = "IPTV 8K"
+MATCH_THRESHOLD = "0.85"

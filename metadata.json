@@ -1,0 +1,6 @@
+{
+  "name": "XtreamBridge — Stremio Xtream Codes Addon",
+  "description": "Cloudflare Workers Stremio addon bridging Xtream Codes IPTV 8K VOD movies and series to Cinemeta IMDb pages and searchable catalogs.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
