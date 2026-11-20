@@ -14,6 +14,10 @@
       "destination": "/api/addon?__route=test"
     },
     {
+      "source": "/api/live-channels",
+      "destination": "/api/addon?__route=live-channels"
+    },
+    {
       "source": "/api/worker-source",
       "destination": "/api/addon?__route=worker-source"
     },
@@ -24,6 +28,30 @@
     {
       "source": "/worker-ui",
       "destination": "/api/addon?__route=worker-ui"
+    },
+    {
+      "source": "/tv/:config/manifest.json",
+      "destination": "/api/addon?__route=tv-manifest&config=:config"
+    },
+    {
+      "source": "/tv/:config/catalog/tv/:id.json",
+      "destination": "/api/addon?__route=tv-catalog&config=:config&id=:id"
+    },
+    {
+      "source": "/tv/:config/catalog/tv/:id/:extra.json",
+      "destination": "/api/addon?__route=tv-catalog&config=:config&id=:id&extra=:extra"
+    },
+    {
+      "source": "/tv/:config/meta/tv/:id.json",
+      "destination": "/api/addon?__route=tv-meta&config=:config&id=:id"
+    },
+    {
+      "source": "/tv/:config/stream/tv/:id.json",
+      "destination": "/api/addon?__route=tv-stream&config=:config&id=:id"
+    },
+    {
+      "source": "/tv/:config/configure",
+      "destination": "/index.html"
     },
     {
       "source": "/:config/manifest.json",

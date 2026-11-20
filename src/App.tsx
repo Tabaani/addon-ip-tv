@@ -1,11 +1,18 @@
 import { useMemo, useState } from 'react';
 import { ConfigureView } from './components/ConfigureView';
 import { DeployWorkerView } from './components/DeployWorkerView';
+import { LiveChannelItem, LiveTvBuilderView } from './components/LiveTvBuilderView';
 import { MatchLabView } from './components/MatchLabView';
 import { StreamTesterView } from './components/StreamTesterView';
-import { AddonConfig, encodeConfig, validateAndNormalizeHost } from './index';
+import {
+  AddonConfig,
+  LiveStreamFormat,
+  encodeConfig,
+  encodeLiveTvConfig,
+  validateAndNormalizeHost,
+} from './index';
 
-type ActiveTab = 'configure' | 'tester' | 'lab' | 'deploy';
+type ActiveTab = 'configure' | 'livetv' | 'tester' | 'lab' | 'deploy';
 
 const INITIAL_CONFIG: AddonConfig = {
   host: '',
@@ -23,6 +30,20 @@ export default function App() {
     typeof window !== 'undefined' ? window.location.origin : ''
   );
 
+  // Separate Live TV Collection Addon state
+  const [collectionName, setCollectionName] = useState('My Live TV');
+  const [streamFormat, setStreamFormat] = useState<LiveStreamFormat>('both');
+  const [selectedChannels, setSelectedChannels] = useState<LiveChannelItem[]>([]);
+
+  const safeOrigin = useMemo(() => {
+    const rawOrigin = (baseDomain || (typeof window !== 'undefined' ? window.location.origin : ''))
+      .trim()
+      .replace(/\/+$/, '');
+    if (/^https?:\/\/[^/\s]+/i.test(rawOrigin)) return rawOrigin;
+    return typeof window !== 'undefined' ? window.location.origin : '';
+  }, [baseDomain]);
+
+  // VOD Movies & Series Addon URLs
   const { isConfigValid, encodedConfig, manifestUrl, stremioUrl } = useMemo(() => {
     const hostCheck = validateAndNormalizeHost(config.host);
     const hasCreds = config.username.trim().length > 0 && config.password.trim().length > 0;
@@ -40,8 +61,6 @@ export default function App() {
       ...config,
       host: hostCheck.host,
     });
-    const rawOrigin = (baseDomain || window.location.origin).trim().replace(/\/+$/, '');
-    const safeOrigin = /^https?:\/\/[^/\s]+/i.test(rawOrigin) ? rawOrigin : window.location.origin;
     const manifest = `${safeOrigin}/${encoded}/manifest.json`;
     const stremio = `stremio://${manifest.replace(/^https?:\/\//i, '')}`;
 
@@ -51,9 +70,50 @@ export default function App() {
       manifestUrl: manifest,
       stremioUrl: stremio,
     };
-  }, [config, baseDomain]);
+  }, [config, safeOrigin]);
+
+  // Live TV Collection Addon URLs (separate addon under /tv/:config/manifest.json)
+  const { isLiveAddonReady, liveManifestUrl, liveStremioUrl } = useMemo(() => {
+    const hostCheck = validateAndNormalizeHost(config.host);
+    const hasCreds = config.username.trim().length > 0 && config.password.trim().length > 0;
+    const valid = hostCheck.ok && hasCreds && selectedChannels.length > 0;
+    if (!valid) {
+      return {
+        isLiveAddonReady: false,
+        liveManifestUrl: '',
+        liveStremioUrl: '',
+      };
+    }
+
+    const encoded = encodeLiveTvConfig({
+      host: hostCheck.host,
+      username: config.username,
+      password: config.password,
+      name: collectionName.trim() || 'My Live TV',
+      format: streamFormat,
+      channelIds: selectedChannels.map((c) => c.id),
+    });
+    const manifest = `${safeOrigin}/tv/${encoded}/manifest.json`;
+    const stremio = `stremio://${manifest.replace(/^https?:\/\//i, '')}`;
+
+    return {
+      isLiveAddonReady: true,
+      liveManifestUrl: manifest,
+      liveStremioUrl: stremio,
+    };
+  }, [config, safeOrigin, collectionName, streamFormat, selectedChannels]);
 
   const handlePrimaryInstall = () => {
+    if (activeTab === 'livetv') {
+      if (isLiveAddonReady && liveStremioUrl) {
+        window.location.href = liveStremioUrl;
+      } else {
+        const tvHost = document.getElementById('tv-host');
+        if (tvHost) tvHost.focus();
+      }
+      return;
+    }
+
     if (isConfigValid && stremioUrl) {
       window.location.href = stremioUrl;
     } else {
@@ -82,7 +142,8 @@ export default function App() {
           <nav className="flex items-center gap-6 overflow-x-auto text-sm font-medium">
             {(
               [
-                ['configure', 'Configure'],
+                ['configure', 'VOD Addon'],
+                ['livetv', 'Live TV Addon'],
                 ['tester', 'Stream Tester'],
                 ['lab', 'Match Lab'],
                 ['deploy', 'Deploy Worker'],
@@ -112,7 +173,7 @@ export default function App() {
               onClick={handlePrimaryInstall}
               className="rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-700 transition-colors whitespace-nowrap shrink-0"
             >
-              Install in Stremio
+              {activeTab === 'livetv' ? 'Install Live TV' : 'Install VOD Addon'}
             </button>
           </div>
         </div>
@@ -134,6 +195,24 @@ export default function App() {
           />
         )}
 
+        {activeTab === 'livetv' && (
+          <LiveTvBuilderView
+            config={config}
+            onConfigChange={setConfig}
+            baseDomain={baseDomain}
+            onBaseDomainChange={setBaseDomain}
+            collectionName={collectionName}
+            onCollectionNameChange={setCollectionName}
+            streamFormat={streamFormat}
+            onStreamFormatChange={setStreamFormat}
+            selectedChannels={selectedChannels}
+            onSelectedChannelsChange={setSelectedChannels}
+            manifestUrl={liveManifestUrl}
+            stremioUrl={liveStremioUrl}
+            isLiveAddonReady={isLiveAddonReady}
+          />
+        )}
+
         {activeTab === 'tester' && (
           <StreamTesterView
             encodedConfig={encodedConfig}
@@ -149,7 +228,7 @@ export default function App() {
 
       <footer className="border-t border-slate-200 bg-white">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-5 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-slate-500">
-          <span>XtreamBridge · Stateless Stremio Addon for Xtream Codes IPTV</span>
+          <span>XtreamBridge · Stateless Stremio Addons for Xtream Codes VOD & Live TV</span>
           <div className="flex items-center gap-4">
             <a href="/manifest.json" target="_blank" rel="noreferrer" className="hover:text-slate-800">
               Root Manifest

@@ -1098,8 +1098,529 @@ async function handleStream(
   }
 }
 
+/* ============================================================================
+ * Separate Live TV Channel Collection Addon (/tv/:config/...)
+ * ========================================================================== */
+
+export type LiveStreamFormat = 'both' | 'ts' | 'm3u8';
+
+export interface LiveTvAddonConfig {
+  host: string;
+  username: string;
+  password: string;
+  name: string;
+  format: LiveStreamFormat;
+  channelIds: number[];
+}
+
+interface XtreamLiveChannel {
+  num?: number;
+  name: string;
+  stream_type?: string;
+  stream_id: number | string;
+  stream_icon?: string;
+  epg_channel_id?: string | null;
+  added?: string;
+  category_id?: string | number;
+  tv_archive?: number;
+}
+
+interface CompactLiveTvPayload {
+  h: string;
+  u: string;
+  p: string;
+  n?: string;
+  f?: LiveStreamFormat;
+  c: string;
+}
+
+const MAX_SELECTED_CHANNELS = 500;
+const LIVE_SEARCH_RESULT_CAP = 800;
+
+export function encodeLiveTvConfig(config: LiveTvAddonConfig): string {
+  const uniqueIds: number[] = [];
+  const seen = new Set<number>();
+  for (const rawId of config.channelIds) {
+    const num = Number(rawId);
+    if (Number.isInteger(num) && num > 0 && !seen.has(num)) {
+      seen.add(num);
+      uniqueIds.push(num);
+      if (uniqueIds.length >= MAX_SELECTED_CHANNELS) break;
+    }
+  }
+
+  const payload: CompactLiveTvPayload = {
+    h: config.host.trim().replace(/\/+$/, ''),
+    u: config.username.trim(),
+    p: config.password.trim(),
+    n: (config.name || 'My Live TV').trim().slice(0, 60),
+    f: config.format === 'ts' || config.format === 'm3u8' ? config.format : 'both',
+    c: uniqueIds.join(','),
+  };
+
+  const bytes = new TextEncoder().encode(JSON.stringify(payload));
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+export function decodeLiveTvConfig(
+  encoded: string
+): { ok: true; config: LiveTvAddonConfig } | { ok: false; error: string } {
+  try {
+    if (!encoded || encoded.length > 16384) {
+      return { ok: false, error: 'Live TV configuration token is missing or exceeds size limit.' };
+    }
+    const base64 = encoded.replace(/-/g, '+').replace(/_/g, '/');
+    const padLength = (4 - (base64.length % 4)) % 4;
+    const padded = base64 + '='.repeat(padLength);
+    const binary = atob(padded);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+
+    const parsed = JSON.parse(new TextDecoder().decode(bytes)) as Partial<CompactLiveTvPayload>;
+    const hostCheck = validateAndNormalizeHost(parsed.h ?? '');
+    if (!hostCheck.ok) {
+      return { ok: false, error: hostCheck.error };
+    }
+
+    const username = typeof parsed.u === 'string' ? parsed.u.trim() : '';
+    const password = typeof parsed.p === 'string' ? parsed.p.trim() : '';
+    if (!username || !password) {
+      return { ok: false, error: 'Xtream username and password are required in Live TV configuration.' };
+    }
+
+    const channelIds: number[] = [];
+    const seen = new Set<number>();
+    if (typeof parsed.c === 'string' && parsed.c.trim()) {
+      for (const part of parsed.c.split(',')) {
+        const id = Number.parseInt(part.trim(), 10);
+        if (Number.isInteger(id) && id > 0 && !seen.has(id)) {
+          seen.add(id);
+          channelIds.push(id);
+          if (channelIds.length >= MAX_SELECTED_CHANNELS) break;
+        }
+      }
+    }
+
+    if (channelIds.length === 0) {
+      return { ok: false, error: 'Select at least one TV channel to build a Live TV collection addon.' };
+    }
+
+    const rawName = typeof parsed.n === 'string' ? parsed.n.trim() : '';
+    const name = rawName ? rawName.slice(0, 60) : 'My Live TV';
+    const format: LiveStreamFormat =
+      parsed.f === 'ts' || parsed.f === 'm3u8' || parsed.f === 'both' ? parsed.f : 'both';
+
+    return {
+      ok: true,
+      config: {
+        host: hostCheck.host,
+        username,
+        password,
+        name,
+        format,
+        channelIds,
+      },
+    };
+  } catch {
+    return { ok: false, error: 'Failed to decode Live TV Base64 configuration.' };
+  }
+}
+
+function slugifyCollectionName(name: string): string {
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 28);
+  return slug || 'collection';
+}
+
+function buildLiveTvManifest(config: LiveTvAddonConfig) {
+  const slug = slugifyCollectionName(config.name);
+  return {
+    id: `org.custom.xtream.livetv.${slug}`,
+    version: '1.0.0',
+    name: config.name,
+    description: `Custom Live TV channel collection (${config.channelIds.length} hand-picked channels) from your Xtream Codes subscription.`,
+    resources: ['catalog', 'meta', 'stream'],
+    types: ['tv'],
+    idPrefixes: ['xtv:'],
+    catalogs: [
+      {
+        type: 'tv',
+        id: 'iptv-live-collection',
+        name: config.name,
+        extra: [
+          { name: 'search', isRequired: false },
+          { name: 'skip', isRequired: false },
+        ],
+      },
+    ],
+    behaviorHints: {
+      configurable: true,
+      configurationRequired: false,
+    },
+  };
+}
+
+async function handleFetchLiveChannels(
+  request: Request,
+  ctx?: WorkerExecutionContext
+): Promise<Response> {
+  let body: {
+    host?: string;
+    username?: string;
+    password?: string;
+    categoryId?: string;
+    search?: string;
+  };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    return jsonResponse({ ok: false, error: 'Invalid JSON request payload.' }, 400);
+  }
+
+  const hostCheck = validateAndNormalizeHost(body.host ?? '');
+  if (!hostCheck.ok) {
+    return jsonResponse({ ok: false, error: hostCheck.error }, 400);
+  }
+
+  const username = typeof body.username === 'string' ? body.username.trim() : '';
+  const password = typeof body.password === 'string' ? body.password.trim() : '';
+  if (!username || !password) {
+    return jsonResponse({ ok: false, error: 'Xtream username and password are required.' }, 400);
+  }
+
+  const baseConfig: AddonConfig = {
+    host: hostCheck.host,
+    username,
+    password,
+  };
+
+  try {
+    const [categoriesRaw, streamsRaw] = await Promise.all([
+      fetchXtreamAction<XtreamCategory[]>(baseConfig, 'get_live_categories', {}, CATALOG_CACHE_TTL, ctx).catch(
+        () => []
+      ),
+      fetchXtreamAction<XtreamLiveChannel[]>(baseConfig, 'get_live_streams', {}, CATALOG_CACHE_TTL, ctx),
+    ]);
+
+    const streams = Array.isArray(streamsRaw) ? streamsRaw : [];
+    const categoriesList = Array.isArray(categoriesRaw) ? categoriesRaw : [];
+
+    // Count channels per category and build lookup map
+    const categoryNameMap = new Map<string, string>();
+    const categoryCountMap = new Map<string, number>();
+
+    for (const cat of categoriesList) {
+      if (cat && cat.category_id !== undefined) {
+        categoryNameMap.set(String(cat.category_id), String(cat.category_name ?? 'Uncategorized'));
+      }
+    }
+
+    for (const ch of streams) {
+      if (!ch) continue;
+      const cid = String(ch.category_id ?? 'uncategorized');
+      categoryCountMap.set(cid, (categoryCountMap.get(cid) ?? 0) + 1);
+    }
+
+    const categories = categoriesList
+      .map((cat) => {
+        const id = String(cat.category_id);
+        return {
+          id,
+          name: String(cat.category_name ?? 'Uncategorized'),
+          count: categoryCountMap.get(id) ?? 0,
+        };
+      })
+      .filter((c) => c.count > 0);
+
+    const requestedSearch = typeof body.search === 'string' ? body.search.trim().toLowerCase() : '';
+    let activeCategoryId = typeof body.categoryId === 'string' ? body.categoryId.trim() : '';
+
+    // When no search and no explicit category, default to the first non-empty category to keep payload fast & small
+    if (!requestedSearch && !activeCategoryId && categories.length > 0) {
+      activeCategoryId = categories[0].id;
+    }
+
+    const filtered: Array<{
+      id: number;
+      name: string;
+      categoryId: string;
+      categoryName: string;
+      icon?: string;
+    }> = [];
+    let matchedCount = 0;
+
+    for (const ch of streams) {
+      if (!ch || !ch.name) continue;
+      const streamId = Number.parseInt(String(ch.stream_id), 10);
+      if (!Number.isInteger(streamId) || streamId <= 0) continue;
+
+      const cid = String(ch.category_id ?? 'uncategorized');
+      if (activeCategoryId && activeCategoryId !== 'all' && cid !== activeCategoryId) {
+        continue;
+      }
+
+      const catName = categoryNameMap.get(cid) ?? 'Uncategorized';
+      if (requestedSearch) {
+        const inName = ch.name.toLowerCase().includes(requestedSearch);
+        const inCat = catName.toLowerCase().includes(requestedSearch);
+        if (!inName && !inCat) continue;
+      }
+
+      matchedCount++;
+      if (filtered.length < LIVE_SEARCH_RESULT_CAP) {
+        const icon =
+          typeof ch.stream_icon === 'string' && /^https?:\/\//i.test(ch.stream_icon.trim())
+            ? ch.stream_icon.trim()
+            : undefined;
+        filtered.push({
+          id: streamId,
+          name: ch.name.trim(),
+          categoryId: cid,
+          categoryName: catName,
+          ...(icon ? { icon } : {}),
+        });
+      }
+    }
+
+    return jsonResponse({
+      ok: true,
+      normalizedHost: hostCheck.host,
+      totalChannels: streams.length,
+      matchedCount,
+      truncated: matchedCount > LIVE_SEARCH_RESULT_CAP,
+      activeCategoryId: activeCategoryId || 'all',
+      categories,
+      channels: filtered,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unable to fetch Live TV channels.';
+    return jsonResponse(
+      {
+        ok: false,
+        error: `Failed to fetch Live TV channels (${message}). Confirm credentials and host protocol.`,
+      },
+      502
+    );
+  }
+}
+
+async function getSelectedLiveChannels(
+  config: LiveTvAddonConfig,
+  ctx?: WorkerExecutionContext
+): Promise<{ channels: XtreamLiveChannel[]; categoryMap: Map<string, string> }> {
+  const baseConfig: AddonConfig = {
+    host: config.host,
+    username: config.username,
+    password: config.password,
+  };
+
+  const [streamsRaw, categoriesRaw] = await Promise.all([
+    fetchXtreamAction<XtreamLiveChannel[]>(baseConfig, 'get_live_streams', {}, CATALOG_CACHE_TTL, ctx),
+    fetchXtreamAction<XtreamCategory[]>(baseConfig, 'get_live_categories', {}, CATALOG_CACHE_TTL, ctx).catch(
+      () => []
+    ),
+  ]);
+
+  const categoryMap = new Map<string, string>();
+  if (Array.isArray(categoriesRaw)) {
+    for (const cat of categoriesRaw) {
+      if (cat && cat.category_id !== undefined) {
+        categoryMap.set(String(cat.category_id), String(cat.category_name ?? 'Live TV'));
+      }
+    }
+  }
+
+  const byId = new Map<number, XtreamLiveChannel>();
+  if (Array.isArray(streamsRaw)) {
+    for (const ch of streamsRaw) {
+      if (!ch) continue;
+      const id = Number.parseInt(String(ch.stream_id), 10);
+      if (Number.isInteger(id) && id > 0) {
+        byId.set(id, ch);
+      }
+    }
+  }
+
+  // Preserve the exact channel order selected by the user
+  const ordered: XtreamLiveChannel[] = [];
+  for (const id of config.channelIds) {
+    const found = byId.get(id);
+    if (found) ordered.push(found);
+  }
+
+  return { channels: ordered, categoryMap };
+}
+
+async function handleLiveTvCatalog(
+  config: LiveTvAddonConfig,
+  catalogId: string,
+  extraSegment: string | undefined,
+  ctx?: WorkerExecutionContext
+): Promise<Response> {
+  if (catalogId !== 'iptv-live-collection') {
+    return jsonResponse({ metas: [] });
+  }
+
+  const { search, skip } = parseExtraParams(extraSegment);
+  const lowerSearch = search.toLowerCase();
+
+  try {
+    const { channels, categoryMap } = await getSelectedLiveChannels(config, ctx);
+    const filtered = lowerSearch
+      ? channels.filter((ch) => {
+          const catName = categoryMap.get(String(ch.category_id ?? '')) ?? '';
+          return ch.name.toLowerCase().includes(lowerSearch) || catName.toLowerCase().includes(lowerSearch);
+        })
+      : channels;
+
+    const page = filtered.slice(skip, skip + CATALOG_PAGE_SIZE);
+    const metas = page.map((ch) => {
+      const catName = categoryMap.get(String(ch.category_id ?? ''));
+      const poster =
+        typeof ch.stream_icon === 'string' && /^https?:\/\//i.test(ch.stream_icon.trim())
+          ? ch.stream_icon.trim()
+          : undefined;
+
+      return {
+        id: `xtv:${ch.stream_id}`,
+        type: 'tv' as const,
+        name: ch.name,
+        poster,
+        logo: poster,
+        posterShape: 'square' as const,
+        genres: catName ? [catName] : ['Live TV'],
+        description: catName ? `${ch.name} · ${catName}` : ch.name,
+      };
+    });
+
+    return jsonResponse({ metas }, 200, {
+      'Cache-Control': 'public, max-age=300',
+    });
+  } catch {
+    return jsonResponse({ metas: [] }, 200);
+  }
+}
+
+async function handleLiveTvMeta(
+  config: LiveTvAddonConfig,
+  rawId: string,
+  ctx?: WorkerExecutionContext
+): Promise<Response> {
+  const decodedId = decodeURIComponent(rawId).replace(/\.json$/i, '').trim();
+  const match = decodedId.match(/^xtv:(\d+)$/);
+  if (!match) {
+    return jsonResponse({ meta: null }, 404);
+  }
+
+  const streamId = Number.parseInt(match[1], 10);
+  if (!config.channelIds.includes(streamId)) {
+    return jsonResponse({ meta: null }, 404);
+  }
+
+  try {
+    const { channels, categoryMap } = await getSelectedLiveChannels(config, ctx);
+    const ch = channels.find((item) => Number.parseInt(String(item.stream_id), 10) === streamId);
+    if (!ch) {
+      return jsonResponse({ meta: null }, 404);
+    }
+
+    const catName = categoryMap.get(String(ch.category_id ?? ''));
+    const poster =
+      typeof ch.stream_icon === 'string' && /^https?:\/\//i.test(ch.stream_icon.trim())
+        ? ch.stream_icon.trim()
+        : undefined;
+
+    return jsonResponse(
+      {
+        meta: {
+          id: `xtv:${streamId}`,
+          type: 'tv',
+          name: ch.name,
+          poster,
+          logo: poster,
+          background: poster,
+          posterShape: 'square',
+          genres: catName ? [catName] : ['Live TV'],
+          description: catName
+            ? `Live TV stream from ${config.name} (${catName}).`
+            : `Live TV stream from ${config.name}.`,
+        },
+      },
+      200,
+      { 'Cache-Control': 'public, max-age=300' }
+    );
+  } catch {
+    return jsonResponse({ meta: null }, 200);
+  }
+}
+
+async function handleLiveTvStream(
+  config: LiveTvAddonConfig,
+  rawId: string,
+  ctx?: WorkerExecutionContext
+): Promise<Response> {
+  const decodedId = decodeURIComponent(rawId).replace(/\.json$/i, '').trim();
+  const match = decodedId.match(/^xtv:(\d+)$/);
+  if (!match) {
+    return jsonResponse({ streams: [] });
+  }
+
+  const streamId = Number.parseInt(match[1], 10);
+  if (!config.channelIds.includes(streamId)) {
+    return jsonResponse({ streams: [] });
+  }
+
+  let channelName = `Channel #${streamId}`;
+  try {
+    const { channels } = await getSelectedLiveChannels(config, ctx);
+    const found = channels.find((item) => Number.parseInt(String(item.stream_id), 10) === streamId);
+    if (found?.name) channelName = found.name;
+  } catch {
+    // Fallback to stream ID label if catalog metadata lookup fails
+  }
+
+  const encodedUser = encodeURIComponent(config.username);
+  const encodedPass = encodeURIComponent(config.password);
+  const streams: StremioStream[] = [];
+
+  if (config.format === 'both' || config.format === 'ts') {
+    streams.push({
+      name: `${config.name}\n[Live TS]`,
+      title: `${channelName}\nMPEG-TS Direct Stream (Recommended for ExoPlayer / MPV)`,
+      url: `${config.host}/live/${encodedUser}/${encodedPass}/${streamId}.ts`,
+      behaviorHints: {
+        notWebReady: true,
+      },
+    });
+  }
+
+  if (config.format === 'both' || config.format === 'm3u8') {
+    streams.push({
+      name: `${config.name}\n[Live HLS]`,
+      title: `${channelName}\nHLS Adaptive Stream (.m3u8)`,
+      url: `${config.host}/live/${encodedUser}/${encodedPass}/${streamId}.m3u8`,
+      behaviorHints: {
+        notWebReady: true,
+      },
+    });
+  }
+
+  return jsonResponse({ streams }, 200, {
+    'Cache-Control': 'public, max-age=120',
+  });
+}
+
 /**
- * Main Web Fetch API router (used natively by Cloudflare Workers and mounted by Express in dev).
+ * Main Web Fetch API router (used natively by Cloudflare Workers and mounted by Express / Vercel).
  */
 export async function handleWorkerRequest(
   request: Request,
@@ -1124,6 +1645,11 @@ export async function handleWorkerRequest(
     return handleTestConnection(request);
   }
 
+  // Fetch Xtream Live TV categories and channels for collection builder
+  if (request.method === 'POST' && path === '/api/live-channels') {
+    return handleFetchLiveChannels(request, ctx);
+  }
+
   // Unconfigured root manifest (prompts Stremio to open /configure)
   if (request.method === 'GET' && path === '/manifest.json') {
     return jsonResponse(buildManifest(false, brand));
@@ -1133,7 +1659,49 @@ export async function handleWorkerRequest(
     return jsonResponse({ error: 'Method not allowed' }, 405);
   }
 
-  // Configured Stremio routes:
+  /* ---- Live TV Collection Addon routes (/tv/:config/...) ---- */
+  const tvConfigureMatch = path.match(/^\/tv\/([^/]+)\/configure\/?$/);
+  if (tvConfigureMatch) {
+    return htmlResponse(renderConfigHtml(url.origin));
+  }
+
+  const tvManifestMatch = path.match(/^\/tv\/([^/]+)\/manifest\.json$/);
+  if (tvManifestMatch) {
+    const decoded = decodeLiveTvConfig(tvManifestMatch[1]);
+    if (!decoded.ok) {
+      return jsonResponse({ error: decoded.error }, 400);
+    }
+    return jsonResponse(buildLiveTvManifest(decoded.config));
+  }
+
+  const tvCatalogMatch = path.match(/^\/tv\/([^/]+)\/catalog\/tv\/([^/]+?)(?:\/([^/]+))?\.json$/);
+  if (tvCatalogMatch) {
+    const decoded = decodeLiveTvConfig(tvCatalogMatch[1]);
+    if (!decoded.ok) {
+      return jsonResponse({ metas: [], error: decoded.error }, 400);
+    }
+    return handleLiveTvCatalog(decoded.config, tvCatalogMatch[2], tvCatalogMatch[3], ctx);
+  }
+
+  const tvMetaMatch = path.match(/^\/tv\/([^/]+)\/meta\/tv\/([^/]+)\.json$/);
+  if (tvMetaMatch) {
+    const decoded = decodeLiveTvConfig(tvMetaMatch[1]);
+    if (!decoded.ok) {
+      return jsonResponse({ meta: null, error: decoded.error }, 400);
+    }
+    return handleLiveTvMeta(decoded.config, tvMetaMatch[2], ctx);
+  }
+
+  const tvStreamMatch = path.match(/^\/tv\/([^/]+)\/stream\/tv\/([^/]+)\.json$/);
+  if (tvStreamMatch) {
+    const decoded = decodeLiveTvConfig(tvStreamMatch[1]);
+    if (!decoded.ok) {
+      return jsonResponse({ streams: [], error: decoded.error }, 400);
+    }
+    return handleLiveTvStream(decoded.config, tvStreamMatch[2], ctx);
+  }
+
+  /* ---- VOD Movies & Series Addon routes (/:config/...) ---- */
   // 1) GET /:config/configure
   const configureMatch = path.match(/^\/([^/]+)\/configure\/?$/);
   if (configureMatch) {

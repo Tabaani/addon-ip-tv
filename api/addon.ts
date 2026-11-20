@@ -103,6 +103,8 @@ function resolveCanonicalPath(parsedUrl: URL): string {
   switch (route) {
     case 'test':
       return '/api/test';
+    case 'live-channels':
+      return '/api/live-channels';
     case 'worker-ui':
       return '/worker-ui';
     case 'root-manifest':
@@ -116,6 +118,17 @@ function resolveCanonicalPath(parsedUrl: URL): string {
       return `/${encodeURIComponent(config)}/catalog/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json`;
     case 'stream':
       return `/${encodeURIComponent(config)}/stream/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json`;
+    case 'tv-manifest':
+      return `/tv/${encodeURIComponent(config)}/manifest.json`;
+    case 'tv-catalog':
+      if (extra) {
+        return `/tv/${encodeURIComponent(config)}/catalog/tv/${encodeURIComponent(id)}/${extra}.json`;
+      }
+      return `/tv/${encodeURIComponent(config)}/catalog/tv/${encodeURIComponent(id)}.json`;
+    case 'tv-meta':
+      return `/tv/${encodeURIComponent(config)}/meta/tv/${encodeURIComponent(id)}.json`;
+    case 'tv-stream':
+      return `/tv/${encodeURIComponent(config)}/stream/tv/${encodeURIComponent(id)}.json`;
     default:
       return parsedUrl.pathname;
   }

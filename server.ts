@@ -119,8 +119,14 @@ async function startServer() {
 
   // Mount live Cloudflare Worker API & Stremio Addon protocol endpoints
   app.all('/api/test', bridgeToWorker);
+  app.all('/api/live-channels', bridgeToWorker);
   app.all('/worker-ui', bridgeToWorker);
   app.all('/manifest.json', bridgeToWorker);
+  app.all('/tv/:config/manifest.json', bridgeToWorker);
+  app.all('/tv/:config/catalog/tv/:id.json', bridgeToWorker);
+  app.all('/tv/:config/catalog/tv/:id/:extra.json', bridgeToWorker);
+  app.all('/tv/:config/meta/tv/:id.json', bridgeToWorker);
+  app.all('/tv/:config/stream/tv/:id.json', bridgeToWorker);
   app.all('/:config/manifest.json', bridgeToWorker);
   app.all('/:config/catalog/:type/:id.json', bridgeToWorker);
   app.all('/:config/catalog/:type/:id/:extra.json', bridgeToWorker);
